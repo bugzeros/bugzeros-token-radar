@@ -1,8 +1,8 @@
-// Token Radar, radar-2: a comparables-priced dashboard. It reads window.RADAR
+// Token Radar, radar-3: a fitted-curve dashboard. It reads window.RADAR
 // (written beside dashboard/ by main.ts) and renders the ranked board, a
 // filterable table, a per-protocol detail view with the model's own inputs
-// and the protocol's farm plan, and the comparables table the model ran on.
-// No network: every byte it shows is in data.js.
+// and the protocol's farm plan, and the fitted model with its out-of-sample
+// validation. No network: every byte it shows is in data.js.
 (function () {
   'use strict';
 
@@ -34,8 +34,15 @@
   }
   // The model in one function: the page recomputes a row from the snapshot figures and checks the
   // number board.json carries, so the page's code and the board's data are visibly the same arithmetic.
+  // The fitted curve: ln(implied) = intercept + slope x ln(TVL) + category offset
+  // + growth x growth_z + age x ln1p(age) + chains x chains_z, with the coefficients
+  // DATA.model carries from the run that built data.js. A category with no listed
+  // protocol carries offset 0 and prices off the fitted global curve.
   function impliedOf(row) {
-    return Math.max(1, Math.round(row.tvl_usd * row.comp_multiple * row.growth_multiplier * row.maturity_multiplier * row.chains_multiplier));
+    var m = DATA.model;
+    var logImplied = m.intercept + m.slope * Math.log(row.tvl_usd) + row.category_offset
+      + m.growth * row.growth_z + m.age * row.log_age + m.chains * row.chains_z;
+    return Math.max(1, Math.min(m.implied_cap, Math.round(Math.exp(logImplied))));
   }
 
   function el(tag, attrs) {
@@ -165,7 +172,7 @@
       else if (key === 'tvl') { av = a.tvl_usd; bv = b.tvl_usd; }
       else if (key === 'growth') { av = a.change_7d === null ? -Infinity : a.change_7d; bv = b.change_7d === null ? -Infinity : b.change_7d; }
       else if (key === 'age') { av = a.age_days === null ? Infinity : a.age_days; bv = b.age_days === null ? Infinity : b.age_days; }
-      else if (key === 'mult') { av = a.comp_multiple; bv = b.comp_multiple; }
+      else if (key === 'mult') { av = a.fitted_multiple; bv = b.fitted_multiple; }
       else { av = a.implied_value_usd; bv = b.implied_value_usd; }
       if (av < bv) return -state.dir;
       if (av > bv) return state.dir;
@@ -188,12 +195,12 @@
     return el('section', { class: 'lede' },
       el('div', null,
         el('h1', { text: DATA.watchlist_size + ' watchlist protocols, ranked by implied value' }),
-        el('p', { text: 'The watchlist is the floor: every protocol with at least $' + Math.round(DATA.floor_usd / 1e6) + 'M of TVL and no token on record. The early radar adds ' + DATA.early_size + ' pre-token protocols below that floor, every launch candidate the snapshot holds. Each value is priced off the listed protocols in its own category, never off a flat multiple. Implied value is a model, not a promise.' })
+        el('p', { text: 'The watchlist is the floor: every protocol with at least $' + Math.round(DATA.floor_usd / 1e6) + 'M of TVL and no token on record. The early radar adds ' + DATA.early_size + ' pre-token protocols below that floor, every launch candidate the snapshot holds. Each value is priced by a curve fitted to the listed protocols in this snapshot: value grows with TVL to the power ' + DATA.model.slope.toFixed(2) + ', not one-for-one, with a shrunk offset per category. Implied value is a model, not a promise.' })
       ),
       el('div', { class: 'facts' },
         el('div', { class: 'fact' }, el('span', { text: 'Watchlist covered' }), el('b', { text: DATA.watchlist_size + ' / ' + DATA.watchlist_size })),
         el('div', { class: 'fact' }, el('span', { text: 'Pre-token rows scored' }), el('b', { text: String(DATA.board_size) })),
-        el('div', { class: 'fact' }, el('span', { text: 'Market median FDV/TVL' }), el('b', { text: DATA.global_multiple.toFixed(3) + 'x (' + DATA.global_comps + ' listed)' })),
+        el('div', { class: 'fact' }, el('span', { text: 'Fitted size slope' }), el('b', { text: 'TVL^' + DATA.model.slope.toFixed(2) + ' (' + DATA.model.comps_n + ' listed)' })),
         el('div', { class: 'fact' }, el('span', { text: 'Live-token protocols set aside' }), el('b', { text: String(DATA.live_size) }))
       )
     );
@@ -284,7 +291,7 @@
         el('td', { class: 'num', text: fmtUsd(r.tvl_usd) }),
         el('td', { class: 'num ' + growthClass, text: growth }),
         el('td', { class: 'num', text: fmtAge(r.age_days) }),
-        el('td', { class: 'num', text: fmtMult(r.comp_multiple) }),
+        el('td', { class: 'num', text: fmtMult(r.fitted_multiple) }),
         el('td', null, el('div', { class: 'implied' },
           el('div', { class: 'bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' })),
           el('span', { class: 'num', text: fmtUsd(r.implied_value_usd) })
@@ -303,7 +310,7 @@
             sortHeader('tvl', 'TVL'),
             sortHeader('growth', '7d'),
             sortHeader('age', 'Age'),
-            sortHeader('mult', 'FDV/TVL'),
+            sortHeader('mult', 'Value/TVL'),
             sortHeader('implied', 'Implied value'),
             el('th', { scope: 'col', text: 'Token' })
           )),
@@ -339,29 +346,52 @@
 
   function modelPanel() {
     var m = DATA.model;
+    var v = DATA.validation;
+    function signed(n) { return (n >= 0 ? '+ ' : '- ') + Math.abs(n).toFixed(3); }
     var compRows = DATA.comps.map(function (c) {
       return el('tr', null,
         el('td', { text: c.category }),
         el('td', { class: 'num', text: String(c.n) }),
         el('td', { class: 'num', text: fmtMult(c.median_multiple) }),
-        el('td', { text: c.used ? 'used' : 'too few: market median' })
+        el('td', { class: 'num', text: (c.offset >= 0 ? '+' : '') + c.offset.toFixed(3) }),
+        el('td', { class: 'num', text: c.offset_factor.toFixed(3) + 'x' }),
+        el('td', { class: 'num', text: c.shrink.toFixed(2) })
       );
     });
+    function validationRow(p) {
+      return el('tr', null,
+        el('td', { text: p.name + ' (' + p.test_n + ' held out)' }),
+        el('td', { class: 'num', text: p.baseline.med_abs_log_err.toFixed(3) }),
+        el('td', { class: 'num', text: p.fitted.med_abs_log_err.toFixed(3) }),
+        el('td', { class: 'num', text: p.baseline.mean_abs_log_err.toFixed(3) }),
+        el('td', { class: 'num', text: p.fitted.mean_abs_log_err.toFixed(3) }),
+        el('td', { class: 'num', text: (p.fitted.within_2x * 100).toFixed(0) + '%' })
+      );
+    }
     return el('section', { class: 'panel model' },
       el('h2', { text: 'How implied value is computed' }),
-      el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
+      el('p', { class: 'sub', text: 'A curve fitted to the ' + m.comps_n + ' listed protocols in this snapshot, not a flat multiple and not a hand-picked formula. Every row is scored by the same function. No protocol name is special-cased, and no coefficient is written in by hand.' }),
       el('div', { class: 'formula' },
-        'implied = round( tvl_usd x comp_multiple x (1 + ' + m.growth_weight + ' x tanh(clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / ' + m.growth_scale + ')) x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x (1 + ' + m.chain_step + ' x min(chains - 1, ' + m.chain_max + ')) )'
+        'ln(implied) = ' + m.intercept.toFixed(3) + ' ' + signed(m.slope) + ' x ln(tvl_usd) + offset[category] ' + signed(m.growth) + ' x growth_z ' + signed(m.age) + ' x ln(1 + age_days) ' + signed(m.chains) + ' x chains_z'
       ),
-      el('p', { class: 'sub', text: 'The multiple is the median FDV/TVL of the listed protocols in the same category, computed from this snapshot on every run. A category with fewer than ' + m.min_comps + ' listed comparables uses the market median of ' + DATA.global_multiple.toFixed(3) + 'x across ' + DATA.global_comps + ' listed protocols. TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. Above the $' + Math.round(DATA.floor_usd / 1e6) + 'M floor the board ranks only the watchlist: the house drew it with a record the snapshot does not carry, so a protocol the watchlist leaves out stays out. Below the floor, every launch candidate counts.' }),
+      el('p', { class: 'sub', text: 'Value grows with TVL to the power ' + m.slope.toFixed(2) + ': the market pays about nine times as much for a hundred times the size, so a flat multiple would overvalue the largest protocols and undervalue the smallest. The category offset is the shrunk mean residual of the category\'s listed protocols, n / (n + ' + m.shrink_k + ') of the raw mean, so a category with one comparable barely moves the curve and a category with none prices off the fitted global curve. The fitted weights are small and the model says so: a hot week is worth ' + m.growth.toFixed(2) + ' of a log point, age ' + m.age.toFixed(2) + ' (how long a protocol has run barely moves its multiple once size is accounted for), chains ' + m.chains.toFixed(2) + '. Age unknown uses ' + m.unknown_age_days + ' days; growth_z is change_7d clamped to -60..120 and divided by 50; chains_z is min(chains - 1, 10) / 10. Above the $' + Math.round(DATA.floor_usd / 1e6) + 'M floor the board ranks only the watchlist: the house drew it with a record the snapshot does not carry, so a protocol the watchlist leaves out stays out. Below the floor, every launch candidate counts.' }),
+      el('h3', { text: 'Out-of-sample validation: fitted model vs the old median formula' }),
+      el('p', { class: 'sub', text: 'Both models are fitted on the training part only and scored on the held-out part, in absolute log error |ln(predicted / actual)| on market cap. Lower is better; the last column is the share of held-out protocols the fitted model prices within twice the actual value. A typical listed protocol is priced within ' + (Math.exp(m.med_abs_log_err)).toFixed(1) + 'x in-sample.' }),
+      el('div', { class: 'table-wrap' },
+        el('table', { class: 'comps' },
+          el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Protocol' }), el('th', { scope: 'col', text: 'Median baseline' }), el('th', { scope: 'col', text: 'Median fitted' }), el('th', { scope: 'col', text: 'Mean baseline' }), el('th', { scope: 'col', text: 'Mean fitted' }), el('th', { scope: 'col', text: 'Fitted within 2x' }))),
+          el('tbody', null, [validationRow(v.walk_forward), validationRow(v.cv5), validationRow(v.category_holdout)])
+        )
+      ),
+      el('p', { class: 'sub', text: 'The fitted model wins the walk-forward test (' + v.walk_forward.note + ') and the five-fold cross-validation by a wide margin, and loses the category holdout (' + v.category_holdout.note + '): when the three biggest categories are removed entirely, the fitted global curve transfers worse than a plain median. The board is priced by the model fitted on all ' + m.comps_n + ' comparables, so every category it ranks is fitted, not held out, but the loss is printed here because a validation that hides its weak protocol is advertising.' }),
       el('h3', { text: 'Comparables by category' }),
       el('div', { class: 'table-wrap' },
         el('table', { class: 'comps' },
-          el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Category' }), el('th', { scope: 'col', text: 'Listed' }), el('th', { scope: 'col', text: 'Median FDV/TVL' }), el('th', { scope: 'col', text: 'Priced' }))),
+          el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Category' }), el('th', { scope: 'col', text: 'Listed' }), el('th', { scope: 'col', text: 'Median FDV/TVL' }), el('th', { scope: 'col', text: 'Offset (log)' }), el('th', { scope: 'col', text: 'Offset factor' }), el('th', { scope: 'col', text: 'Shrink' }))),
           el('tbody', null, compRows)
         )
       ),
-      el('p', { class: 'sub', text: 'Listed protocols in CEX, bridge, liquid staking, stablecoin and CDP categories never price a launch: their tokens price a different business. A multiple above 10x is left out as an outlier before the median is taken.' })
+      el('p', { class: 'sub', text: 'The median column is the raw median multiple of the category\'s listed protocols, for reference. The offset is what the model actually applies, after shrinkage. Listed protocols in CEX, bridge, liquid staking, stablecoin and CDP categories never price a launch: their tokens price a different business. A multiple above 10x is left out as an outlier before the median is taken.' })
     );
   }
 
@@ -375,9 +405,9 @@
     writeHash();
     dialog.textContent = '';
     var steps = farmSteps(row);
-    var compNote = row.comp_n >= 3
-      ? 'Priced at the ' + row.category + ' median of ' + fmtMult(row.comp_multiple) + ' from ' + row.comp_n + ' listed protocols.'
-      : 'Too few listed ' + (row.category || 'protocols') + ' to price from (' + row.comp_n + '), so the market median of ' + DATA.global_multiple.toFixed(3) + 'x is used.';
+    var compNote = row.comp_n >= 1
+      ? 'Priced by the fitted curve: the ' + row.category + ' offset is ' + (row.category_offset >= 0 ? '+' : '') + row.category_offset.toFixed(3) + ' in log terms (x' + Math.exp(row.category_offset).toFixed(2) + ') from ' + row.comp_n + ' listed protocol' + (row.comp_n === 1 ? '' : 's') + '.'
+      : 'No listed ' + (row.category || 'protocols') + ' to price from, so the category offset is 0 and the row prices off the fitted global curve alone.';
     dialog.appendChild(el('div', { class: 'detail-head' },
       el('div', null,
         el('span', { class: 'brand-name', text: 'Rank ' + row.rank + ' of ' + DATA.board_size }),
@@ -390,12 +420,12 @@
       el('h3', { text: 'Implied value' }),
       el('div', { class: 'equation' },
         el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
-        el('div', null, el('span', { text: 'Category multiple' }), el('b', { class: 'num', text: fmtMult(row.comp_multiple) })),
+        el('div', null, el('span', { text: 'Fitted value / TVL' }), el('b', { class: 'num', text: fmtMult(row.fitted_multiple) })),
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
-        el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: String(row.growth_multiplier) })),
+        el('div', null, el('span', { text: 'Growth term' }), el('b', { class: 'num', text: (DATA.model.growth * row.growth_z >= 0 ? '+' : '') + (DATA.model.growth * row.growth_z).toFixed(3) })),
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
-        el('div', null, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: String(row.maturity_multiplier) })),
-        el('div', null, el('span', { text: 'Chains multiplier' }), el('b', { class: 'num', text: String(row.chains_multiplier) })),
+        el('div', null, el('span', { text: 'Age term' }), el('b', { class: 'num', text: (DATA.model.age * row.log_age >= 0 ? '+' : '') + (DATA.model.age * row.log_age).toFixed(3) })),
+        el('div', null, el('span', { text: 'Chains term' }), el('b', { class: 'num', text: (DATA.model.chains * row.chains_z >= 0 ? '+' : '') + (DATA.model.chains * row.chains_z).toFixed(3) })),
         el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
       ),
       el('p', { class: 'sub', text: compNote }),
